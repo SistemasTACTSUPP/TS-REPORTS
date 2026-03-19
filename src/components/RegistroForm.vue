@@ -805,6 +805,10 @@ async function persistRegistro() {
   const userId = authData.user?.id ?? null;
   if (!userId) {
     saving.value = false;
+    toastStore.error(
+      'No se pudo guardar',
+      'No hay sesión activa. Inicia sesión nuevamente con Google.'
+    );
     return;
   }
 
@@ -839,12 +843,17 @@ async function persistRegistro() {
       // eslint-disable-next-line no-console
       console.error('Error generando folio automático (fallback)', folioError2);
       saving.value = false;
+      toastStore.error(
+        'Error al generar folio',
+        'No se pudo obtener el folio automático. Contacta al administrador.'
+      );
       return;
     }
   }
 
   if (!folioAuto) {
     saving.value = false;
+    toastStore.error('Error al generar folio', 'Folio automático viene vacío.');
     return;
   }
 
@@ -930,7 +939,11 @@ async function persistRegistro() {
 
   // UX: volvemos a la pantalla principal y mostramos confirmacion profesional
   toastStore.success('REGISTRO COMPLETADO!', `FOLIO: ${folioAuto}`);
-  router.push({ name: 'home' });
+  try {
+    await router.push({ name: 'home' });
+  } catch (e) {
+    toastStore.error('Error', 'Registro guardado, pero no se pudo regresar al panel.');
+  }
 }
 
 async function onSubmit() {
