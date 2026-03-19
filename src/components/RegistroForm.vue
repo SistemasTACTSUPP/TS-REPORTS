@@ -762,6 +762,170 @@ function toUpperAgricola(id: string) {
   form.inspeccionAgricolaContaminacion[id] = current.toUpperCase();
 }
 
+function getJpegExifOrientation(buffer: ArrayBuffer): number {
+  // Devuelve la orientación EXIF (1..8). Si no existe/está corrupto, retorna 1.
+  // Referencia de etiqueta: Orientation (0x0112).
+  try {
+    const view = new DataView(buffer);
+
+    // SOI marker (Start Of Image) debe ser 0xFFD8 para JPEG
+    if (view.getUint16(0, false) !== 0xffd8) return 1;
+
+    let offset = 2;
+    const length = view.byteLength;
+
+    while (offset < length) {
+      const marker = view.getUint16(offset, false);
+      offset += 2;
+
+      // Llegamos al final (o algo no esperado)
+      if ((marker & 0xff00) !== 0xff00) break;
+
+      // Segment length (incluye los 2 bytes del length)
+      const segmentLength = view.getUint16(offset, false);
+      offset += 2;
+
+      // APP1 (EXIF)
+      if (marker === 0xffe1) {
+        // Verificar "Exif\0\0"
+        // Byte order del TIFF empieza luego del identificador EXIF.
+        const exifStart = offset;
+        const exifHeader =
+          String.fromCharCode(view.getUint8(exifStart)) +
+          String.fromCharCode(view.getUint8(exifStart + 1)) +
+          String.fromCharCode(view.getUint8(exifStart + 2)) +
+          String.fromCharCode(view.getUint8(exifStart + 3));
+
+        if (exifHeader !== 'Exif') {
+          return 1;
+        }
+
+        const tiffStart = exifStart + 6; // "Exif\0\0" son 6 bytes
+        const littleEndian = view.getUint16(tiffStart, false) === 0x4949; // "II" => little endian
+        const endian = littleEndian;
+
+        const firstIfdOffset = view.getUint32(tiffStart + 4, endian);
+        const ifd0 = tiffStart + firstIfdOffset;
+        const entries = view.getUint16(ifd0, endian);
+
+        for (let i = 0; i < entries; i++) {
+          const entryOffset = ifd0 + 2 + i * 12;
+          const tag = view.getUint16(entryOffset, endian);
+          if (tag === 0x0112) {
+            const orientation = view.getUint16(entryOffset + 8, endian);
+            return orientation >= 1 && orientation <= 8 ? orientation : 1;
+          }
+        }
+
+        return 1;
+      }
+
+      offset += segmentLength - 2;
+    }
+  } catch {
+    return 1;
+  }
+
+  return 1;
+}
+
+async function fileToOrientedCompressedJpegDataUrl(file: File): Promise<{
+  dataUrl: string;
+  orientation: number;
+}> {
+  const buffer = await file.arrayBuffer();
+  const orientation = getJpegExifOrientation(buffer);
+
+  // Usamos blob URL para que el navegador decodifique con su pipeline normal.
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const img = new Image();
+    img.decoding = 'async';
+    img.src = objectUrl;
+    await img.decode();
+
+    const naturalW = img.naturalWidth || img.width;
+    const naturalH = img.naturalHeight || img.height;
+
+    // Optimización: limitamos tamaño para no guardar/mandar imágenes enormes.
+    const maxDim = 1600;
+    const scale = Math.min(1, maxDim / Math.max(naturalW, naturalH));
+    const targetW = Math.max(1, Math.round(naturalW * scale));
+    const targetH = Math.max(1, Math.round(naturalH * scale));
+
+    const rotated = orientation >= 5 && orientation <= 8;
+    const canvas = document.createElement('canvas');
+    canvas.width = rotated ? targetH : targetW;
+    canvas.height = rotated ? targetW : targetH;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('No se pudo crear canvas 2D');
+
+    ctx.save();
+
+    // Aplicamos transformaciones basadas en orientación EXIF.
+    switch (orientation) {
+      case 2:
+        ctx.translate(canvas.width, 0);
+        ctx.scale(-1, 1);
+        break;
+      case 3:
+        ctx.translate(canvas.width, canvas.height);
+        ctx.rotate(Math.PI);
+        break;
+      case 4:
+        ctx.translate(0, canvas.height);
+        ctx.scale(1, -1);
+        break;
+      case 5:
+        ctx.rotate(0.5 * Math.PI);
+        ctx.scale(1, -1);
+        break;
+      case 6:
+        ctx.rotate(0.5 * Math.PI);
+        ctx.translate(0, -canvas.height);
+        break;
+      case 7:
+        ctx.rotate(0.5 * Math.PI);
+        ctx.translate(canvas.width, -canvas.height);
+        ctx.scale(-1, 1);
+        break;
+      case 8:
+        ctx.rotate(-0.5 * Math.PI);
+        ctx.translate(-canvas.width, 0);
+        break;
+      // case 1: sin cambios
+      default:
+        break;
+    }
+
+    // Dibujo: al final el canvas ya está dimensionado según la rotación,
+    // por lo que dibujamos ocupando todo el canvas.
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    ctx.restore();
+
+    // Compresión: exportamos como JPEG (en evidencia/Drive/Edge funciona perfecto).
+    // Calidad inicial, si se pasa de tamaño repetimos con menor calidad.
+    const maxBytes = 650 * 1024; // ~650KB por imagen (ajustable)
+    let quality = 0.82;
+    let dataUrl = canvas.toDataURL('image/jpeg', quality);
+
+    const approxBytes = Math.floor((dataUrl.length * 3) / 4);
+    if (approxBytes > maxBytes) {
+      for (const q of [0.72, 0.62, 0.52]) {
+        quality = q;
+        dataUrl = canvas.toDataURL('image/jpeg', quality);
+        const b = Math.floor((dataUrl.length * 3) / 4);
+        if (b <= maxBytes) break;
+      }
+    }
+
+    return { dataUrl, orientation };
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
 async function onPickImage(
   field: keyof RegistroFormModel,
   event: Event,
@@ -771,16 +935,15 @@ async function onPickImage(
   const file = target.files?.[0];
   if (!file) return;
 
-  const reader = new FileReader();
-  reader.onload = () => {
-    const result = reader.result;
-    if (typeof result === 'string') {
-      // @ts-expect-error dynamic
-      form[field] = result;
-      form.exifPorEvidencia[exifKey] = { filename: file.name, size: file.size };
-    }
+  const { dataUrl, orientation } = await fileToOrientedCompressedJpegDataUrl(file);
+
+  // @ts-expect-error dynamic
+  form[field] = dataUrl;
+  form.exifPorEvidencia[exifKey] = {
+    filename: file.name,
+    size: file.size,
+    orientation
   };
-  reader.readAsDataURL(file);
 }
 
 function hasCriticalFailing(): boolean {
@@ -824,42 +987,10 @@ async function persistRegistro() {
     form.comentarios = 'RECHAZADO';
   }
 
-  // Obtener folio automático TS-0001, TS-0002, ...
-  // IMPORTANTE: la función en BD ahora se llama `next_folio_ctpat(p_user_id uuid default null)`.
-  // Mientras se aplica la migración (o si el backend aún no se actualizó), hacemos fallback sin parámetros.
-  let folioAuto: string | null = null;
-  const { data: folioData1, error: folioError1 } = await supabase.rpc('next_folio_ctpat', {
-    p_user_id: userId
-  });
-  if (!folioError1 && folioData1) {
-    folioAuto = folioData1 as string;
-  } else {
-    // eslint-disable-next-line no-console
-    console.warn('Error con RPC next_folio_ctpat(p_user_id). Intentando fallback sin parámetros:', folioError1);
-    const { data: folioData2, error: folioError2 } = await supabase.rpc('next_folio_ctpat');
-    if (!folioError2 && folioData2) {
-      folioAuto = folioData2 as string;
-    } else {
-      // eslint-disable-next-line no-console
-      console.error('Error generando folio automático (fallback)', folioError2);
-      saving.value = false;
-      toastStore.error(
-        'Error al generar folio',
-        'No se pudo obtener el folio automático. Contacta al administrador.'
-      );
-      return;
-    }
-  }
-
-  if (!folioAuto) {
-    saving.value = false;
-    toastStore.error('Error al generar folio', 'Folio automático viene vacío.');
-    return;
-  }
-
-  const payload = {
+  // Si no hay internet, guardamos en una cola local para sincronizar después.
+  // Importante: el folio automático y el insert a BD se harán cuando vuelva la conexión.
+  const insertPayloadBase = {
     service_id: form.numeroTracto.toUpperCase() || null,
-    folio_pdf: folioAuto,
     operador: form.operador.toUpperCase(),
     checklist_tracto: {
       ...form.checklistTracto,
@@ -905,8 +1036,66 @@ async function persistRegistro() {
     comentarios_tipo: form._comentariosTipo,
     comentarios: form.comentarios,
     evidencias_exif: form.exifPorEvidencia,
-    sync_status: 'pending',
     user_id: userId
+  };
+
+  if (!navigator.onLine) {
+    // Si la cola está llena (localStorage), se puede lanzar. En ese caso, avisamos.
+    try {
+      syncStore.enqueueCreateRegistroAndGenerate({ userId, insertPayloadBase });
+      toastStore.info(
+        'REGISTRO EN COLA (OFFLINE)',
+        'Se sincronizará y generará el reporte automáticamente cuando haya internet.'
+      );
+      await router.push({ name: 'home' });
+    } catch {
+      toastStore.error(
+        'No se pudo guardar offline',
+        'La cola local está llena. Intenta con mejor conexión o menos imágenes.'
+      );
+    } finally {
+      saving.value = false;
+    }
+    return;
+  }
+
+  // Obtener folio automático TS-0001, TS-0002, ...
+  // IMPORTANTE: la función en BD ahora se llama `next_folio_ctpat(p_user_id uuid default null)`.
+  // Mientras se aplica la migración (o si el backend aún no se actualizó), hacemos fallback sin parámetros.
+  let folioAuto: string | null = null;
+  const { data: folioData1, error: folioError1 } = await supabase.rpc('next_folio_ctpat', {
+    p_user_id: userId
+  });
+  if (!folioError1 && folioData1) {
+    folioAuto = folioData1 as string;
+  } else {
+    // eslint-disable-next-line no-console
+    console.warn('Error con RPC next_folio_ctpat(p_user_id). Intentando fallback sin parámetros:', folioError1);
+    const { data: folioData2, error: folioError2 } = await supabase.rpc('next_folio_ctpat');
+    if (!folioError2 && folioData2) {
+      folioAuto = folioData2 as string;
+    } else {
+      // eslint-disable-next-line no-console
+      console.error('Error generando folio automático (fallback)', folioError2);
+      saving.value = false;
+      toastStore.error(
+        'Error al generar folio',
+        'No se pudo obtener el folio automático. Contacta al administrador.'
+      );
+      return;
+    }
+  }
+
+  if (!folioAuto) {
+    saving.value = false;
+    toastStore.error('Error al generar folio', 'Folio automático viene vacío.');
+    return;
+  }
+
+  const payload = {
+    ...insertPayloadBase,
+    folio_pdf: folioAuto,
+    sync_status: 'pending'
   };
 
   const { data, error } = await supabase
@@ -925,11 +1114,7 @@ async function persistRegistro() {
 
   const registroId = data.id as string;
 
-  syncStore.enqueueRegistro({
-    id: registroId,
-    createdAt: data.created_at as string,
-    folio: folioAuto
-  });
+  syncStore.enqueueGeneratePdf({ registroId, folio: folioAuto });
 
   if (navigator.onLine) {
     void syncStore.processQueue();
