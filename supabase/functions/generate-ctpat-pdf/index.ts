@@ -6,7 +6,7 @@
 
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts';
 import { createClient } from 'jsr:@supabase/supabase-js@2';
-import { PDFDocument, StandardFonts, rgb, PDFFont, PDFPage } from 'npm:pdf-lib@1.17.1';
+import { PDFDocument, StandardFonts, rgb, PDFFont, PDFPage, degrees } from 'npm:pdf-lib@1.17.1';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
@@ -23,6 +23,7 @@ interface RegistroRow {
   image_urls: string[] | null;
   firma_operador: string | null;
   firma_oficial: string | null;
+  evidencias_exif: Record<string, unknown> | null;
   user_id: string | null;
   created_at: string;
 }
@@ -196,6 +197,157 @@ async function embedDataUrlImage(
   } catch {
     return null;
   }
+}
+
+function getDataUrlMimeAndBytes(dataUrl: string): { mime: string; bytes: Uint8Array } | null {
+  const m = dataUrl.match(/^data:(.+);base64,(.+)$/);
+  if (!m) return null;
+  const mime = m[1].trim().toLowerCase();
+  const b64 = m[2];
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return { mime, bytes };
+}
+
+function getJpegExifOrientation(bytes: Uint8Array): number {
+  // Lee orientación EXIF en JPEG (1..8). Si no existe, retorna 1.
+  try {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (view.byteLength < 4 || view.getUint16(0, false) !== 0xffd8) return 1;
+
+    let offset = 2;
+    while (offset + 4 < view.byteLength) {
+      const marker = view.getUint16(offset, false);
+      offset += 2;
+
+      if (marker === 0xffda || marker === 0xffd9) break; // SOS/EOI
+      if ((marker & 0xff00) !== 0xff00) break;
+
+      const segmentLength = view.getUint16(offset, false);
+      offset += 2;
+      if (segmentLength < 2 || offset + segmentLength - 2 > view.byteLength) break;
+
+      // APP1
+      if (marker === 0xffe1 && segmentLength >= 8) {
+        const exifStart = offset;
+        const isExif =
+          view.getUint8(exifStart) === 0x45 && // E
+          view.getUint8(exifStart + 1) === 0x78 && // x
+          view.getUint8(exifStart + 2) === 0x69 && // i
+          view.getUint8(exifStart + 3) === 0x66; // f
+        if (!isExif) return 1;
+
+        const tiffStart = exifStart + 6; // "Exif\0\0"
+        const littleEndian = view.getUint16(tiffStart, false) === 0x4949;
+        const firstIfdOffset = view.getUint32(tiffStart + 4, littleEndian);
+        const ifd0 = tiffStart + firstIfdOffset;
+        if (ifd0 + 2 > view.byteLength) return 1;
+        const entries = view.getUint16(ifd0, littleEndian);
+
+        for (let i = 0; i < entries; i++) {
+          const entryOffset = ifd0 + 2 + i * 12;
+          if (entryOffset + 12 > view.byteLength) break;
+          const tag = view.getUint16(entryOffset, littleEndian);
+          if (tag === 0x0112) {
+            const orientation = view.getUint16(entryOffset + 8, littleEndian);
+            return orientation >= 1 && orientation <= 8 ? orientation : 1;
+          }
+        }
+        return 1;
+      }
+
+      offset += segmentLength - 2;
+    }
+  } catch {
+    return 1;
+  }
+
+  return 1;
+}
+
+function getEvidenceOrientation(registro: RegistroRow, imageIndex: number, dataUrl: string): number {
+  // 1) Preferimos orientación guardada en evidencias_exif (frontend)
+  const keyByIndex = ['licencia', 'frontal', 'lateral1', 'lateral2', 'puertas_traseras', 'caja_abierta'];
+  const k = keyByIndex[imageIndex];
+  const exifRaw = (registro.evidencias_exif as Record<string, unknown> | null) ?? null;
+  const exifEntry = exifRaw && k ? (exifRaw[k] as Record<string, unknown> | undefined) : undefined;
+  const fromDb = Number(exifEntry?.orientation);
+  if (Number.isFinite(fromDb) && fromDb >= 1 && fromDb <= 8) {
+    return fromDb;
+  }
+
+  // 2) Fallback: leer EXIF del data URL JPEG.
+  const decoded = getDataUrlMimeAndBytes(dataUrl);
+  if (!decoded) return 1;
+  if (!decoded.mime.includes('jpeg') && !decoded.mime.includes('jpg')) return 1;
+  return getJpegExifOrientation(decoded.bytes);
+}
+
+function drawEvidenceImageWithOrientation(
+  page: PDFPage,
+  img: any,
+  orientation: number,
+  innerX: number,
+  innerY: number,
+  innerW: number,
+  innerH: number
+) {
+  const srcW = Number(img.width) || 1;
+  const srcH = Number(img.height) || 1;
+  const swap = orientation === 6 || orientation === 8;
+  const orientedW = swap ? srcH : srcW;
+  const orientedH = swap ? srcW : srcH;
+
+  const fit = Math.min(innerW / orientedW, innerH / orientedH);
+  const finalW = orientedW * fit;
+  const finalH = orientedH * fit;
+
+  const x = innerX + (innerW - finalW) / 2;
+  const y = innerY + (innerH - finalH) / 2;
+
+  if (orientation === 3) {
+    page.drawImage(img, {
+      x: x + finalW,
+      y: y + finalH,
+      width: finalW,
+      height: finalH,
+      rotate: degrees(180)
+    });
+    return;
+  }
+
+  if (orientation === 6) {
+    // 90° CW
+    page.drawImage(img, {
+      x: x + finalW,
+      y,
+      width: finalH,
+      height: finalW,
+      rotate: degrees(90)
+    });
+    return;
+  }
+
+  if (orientation === 8) {
+    // 90° CCW
+    page.drawImage(img, {
+      x,
+      y: y + finalH,
+      width: finalH,
+      height: finalW,
+      rotate: degrees(-90)
+    });
+    return;
+  }
+
+  // 1,2,4,5,7 -> sin rotación explícita (2/4/5/7 son espejos raros en móviles)
+  page.drawImage(img, {
+    x,
+    y,
+    width: finalW,
+    height: finalH
+  });
 }
 
 async function buildPdf(registro: RegistroRow, logoCenterFile?: string | null): Promise<Uint8Array> {
@@ -1634,21 +1786,13 @@ async function buildPdf(registro: RegistroRow, logoCenterFile?: string | null): 
     if (url) {
       const img = await embedDataUrlImage(pdfDoc, url);
       if (img) {
-        // Mejor forma sin deformar:
-        // `scaleToFit(innerW, innerH)` preserva el aspect ratio y evita que la imagen se salga del recuadro.
-        // Luego centramos para que todas se vean bien dentro del mismo cuadro.
         const paddingP4 = 6;
         const innerW = cellWidthP4 - paddingP4 * 2;
         const innerH = imgH - paddingP4 * 2;
-        const dims = img.scaleToFit(innerW, innerH);
-        const drawX = cellX + paddingP4 + (innerW - dims.width) / 2;
-        const drawY = imgBoxBottomY + paddingP4 + (innerH - dims.height) / 2;
-        page4.drawImage(img, {
-          x: drawX,
-          y: drawY,
-          width: dims.width,
-          height: dims.height
-        });
+        const innerX = cellX + paddingP4;
+        const innerY = imgBoxBottomY + paddingP4;
+        const orientation = getEvidenceOrientation(registro, i, url);
+        drawEvidenceImageWithOrientation(page4, img, orientation, innerX, innerY, innerW, innerH);
       } else {
         drawPlaceholderEvidenciaP4(
           page4,
