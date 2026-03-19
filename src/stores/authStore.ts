@@ -24,32 +24,42 @@ export const useAuthStore = defineStore('auth', {
     async initSession() {
       this.loading = true;
       this.driveConfigReady = false;
-      const {
-        data: { session }
-      } = await supabase.auth.getSession();
+      try {
+        const {
+          data: { session }
+        } = await supabase.auth.getSession();
 
-      if (session?.user) {
-        this.isSignedIn = true;
-        this.email = session.user.email ?? null;
-        this.displayName =
-          (session.user.user_metadata?.full_name as string | undefined) ??
-          (session.user.user_metadata?.name as string | undefined) ??
-          this.email;
-        // @ts-expect-error provider_token existe en la sesión cuando el proveedor es OAuth (Google)
-        const token = (session as any).provider_token ?? null;
-        this.googleAccessToken = token;
+        if (session?.user) {
+          this.isSignedIn = true;
+          this.email = session.user.email ?? null;
+          this.displayName =
+            (session.user.user_metadata?.full_name as string | undefined) ??
+            (session.user.user_metadata?.name as string | undefined) ??
+            this.email;
+          // @ts-expect-error provider_token existe en la sesión cuando el proveedor es OAuth (Google)
+          const token = (session as any).provider_token ?? null;
+          this.googleAccessToken = token;
 
-        // Crear carpetas en Drive automáticamente si aún no tiene config
-        if (token) {
-          await this.ensureUserDriveConfig(token);
+          // Crear carpetas en Drive automáticamente si aún no tiene config
+          if (token) {
+            await this.ensureUserDriveConfig(token);
+          }
+        } else {
+          this.isSignedIn = false;
+          this.email = null;
+          this.displayName = null;
+          this.googleAccessToken = null;
         }
-      } else {
+      } catch (e) {
+        // Si falla por CORS/red, no dejamos la UI bloqueada en loading.
+        console.error('Error initSession:', e);
         this.isSignedIn = false;
         this.email = null;
         this.displayName = null;
         this.googleAccessToken = null;
+      } finally {
+        this.loading = false;
       }
-      this.loading = false;
     },
     /**
      * Si el usuario no tiene user_drive_config, crea las carpetas en Google Drive
@@ -121,25 +131,29 @@ export const useAuthStore = defineStore('auth', {
       const redirectTo =
         (import.meta.env.VITE_SITE_URL as string | undefined) ?? window.location.origin;
 
-      const { error } = await supabase.auth.signInWithOAuth({
-        provider: 'google',
-        options: {
-          redirectTo,
-          scopes:
-            'openid profile email https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive',
-          queryParams: {
-            access_type: 'offline',
-            prompt: 'consent'
+      try {
+        const { error } = await supabase.auth.signInWithOAuth({
+          provider: 'google',
+          options: {
+            redirectTo,
+            scopes:
+              'openid profile email https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive',
+            queryParams: {
+              access_type: 'offline',
+              prompt: 'consent'
+            }
           }
+        });
+
+        if (error) {
+          // eslint-disable-next-line no-console
+          console.error('Error signInWithGoogle', error);
         }
-      });
-
-      if (error) {
-        // eslint-disable-next-line no-console
-        console.error('Error signInWithGoogle', error);
+      } catch (e) {
+        console.error('Error signInWithGoogle:', e);
+      } finally {
+        this.loading = false;
       }
-
-      this.loading = false;
     },
     async signOut() {
       await supabase.auth.signOut();
