@@ -1,5 +1,7 @@
 <template>
   <div class="min-h-screen flex flex-col bg-slate-50">
+    <ToastContainer />
+
     <header class="bg-white border-b border-slate-200/80 shadow-card sticky top-0 z-10">
       <div class="max-w-4xl mx-auto px-4 sm:px-6">
         <div class="flex items-center justify-between h-16">
@@ -58,6 +60,7 @@
 import { onMounted } from 'vue';
 import { useAuthStore } from './stores/authStore';
 import { useSyncStore } from './stores/syncStore';
+import ToastContainer from './components/ToastContainer.vue';
 
 const auth = useAuthStore();
 const sync = useSyncStore();

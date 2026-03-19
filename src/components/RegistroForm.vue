@@ -535,7 +535,9 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue';
 import { VueSignaturePad } from 'vue-signature-pad';
+import { useRouter } from 'vue-router';
 import { supabase } from '../supabaseClient';
+import { useToastStore } from '../stores/toastStore';
 import { useSyncStore } from '../stores/syncStore';
 import ImagePicker from './ImagePicker.vue';
 
@@ -588,6 +590,8 @@ interface RegistroFormModel {
 }
 
 const syncStore = useSyncStore();
+const toastStore = useToastStore();
+const router = useRouter();
 
 const checklistTractoItems = [
   { key: 'DEFENSA', label: 'DEFENSA' },
@@ -905,6 +909,7 @@ async function persistRegistro() {
   if (error) {
     // eslint-disable-next-line no-console
     console.error('Error insert registro', error);
+    toastStore.error('Error al guardar el registro', error.message ?? 'Intenta nuevamente.');
     saving.value = false;
     return;
   }
@@ -922,6 +927,10 @@ async function persistRegistro() {
   }
 
   saving.value = false;
+
+  // UX: volvemos a la pantalla principal y mostramos confirmacion profesional
+  toastStore.success('REGISTRO COMPLETADO!', `FOLIO: ${folioAuto}`);
+  router.push({ name: 'home' });
 }
 
 async function onSubmit() {
