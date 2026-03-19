@@ -116,7 +116,10 @@ export const useAuthStore = defineStore('auth', {
     },
     async signInWithGoogle() {
       this.loading = true;
-      const redirectTo = window.location.origin;
+      // En despliegues (Vercel) evitamos que OAuth quede apuntando a `localhost`
+      // usando una URL fija configurable desde Vercel.
+      const redirectTo =
+        (import.meta.env.VITE_SITE_URL as string | undefined) ?? window.location.origin;
 
       const { error } = await supabase.auth.signInWithOAuth({
         provider: 'google',
