@@ -114,6 +114,22 @@ export const useSyncStore = defineStore('sync', {
         } = await supabase.auth.getSession();
         // @ts-expect-error provider_token está presente cuando el proveedor es OAuth (Google)
         const accessToken: string | undefined = (session as any)?.provider_token;
+        // JWT de Supabase del usuario autenticado (necesario para que la Edge Function autorice la llamada)
+        const supabaseAccessTokenCandidate: unknown =
+          (session as any)?.access_token ??
+          (session as any)?.accessToken ??
+          (session as any)?.token?.access_token;
+
+        const supabaseAccessToken =
+          typeof supabaseAccessTokenCandidate === 'string'
+            ? supabaseAccessTokenCandidate
+            : undefined;
+
+        const looksLikeJwt = (t: string | undefined): boolean => {
+          if (!t) return false;
+          // Un JWT típico tiene 3 secciones separadas por '.'
+          return t.split('.').length === 3;
+        };
 
         for (const item of this.queue) {
           if (item.status !== 'pending') continue;
@@ -128,12 +144,26 @@ export const useSyncStore = defineStore('sync', {
                   'No hay token de Google disponible (provider_token). Cierra sesión y vuelve a iniciar con Google.'
                 );
               }
+              if (!supabaseAccessToken) {
+                throw new Error(
+                  'No hay token JWT de Supabase disponible. Inicia sesión nuevamente con Google.'
+                );
+              }
+              if (!looksLikeJwt(supabaseAccessToken)) {
+                throw new Error(
+                  `El token enviado no parece JWT de Supabase (empieza con: ${supabaseAccessToken.slice(
+                    0,
+                    12
+                  )}).`
+                );
+              }
 
               const payload = item.payload as GeneratePdfPayload;
               const res = await fetch(`${functionsBaseUrl}/generate-ctpat-pdf`, {
                 method: 'POST',
                 headers: {
-                  'Content-Type': 'application/json'
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${supabaseAccessToken}`
                 },
                 body: JSON.stringify({ registroId: payload.registroId, accessToken })
               });
@@ -183,11 +213,25 @@ export const useSyncStore = defineStore('sync', {
                   'Registro creado pero falta token Google (provider_token). Reintenta iniciando sesión con Google.'
                 );
               }
+              if (!supabaseAccessToken) {
+                throw new Error(
+                  'Registro creado pero falta el JWT de Supabase. Cierra sesión y vuelve a iniciar con Google.'
+                );
+              }
+              if (!looksLikeJwt(supabaseAccessToken)) {
+                throw new Error(
+                  `El token enviado no parece JWT de Supabase (empieza con: ${supabaseAccessToken.slice(
+                    0,
+                    12
+                  )}).`
+                );
+              }
 
               const res = await fetch(`${functionsBaseUrl}/generate-ctpat-pdf`, {
                 method: 'POST',
                 headers: {
-                  'Content-Type': 'application/json'
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${supabaseAccessToken}`
                 },
                 body: JSON.stringify({ registroId: inserted.id, accessToken })
               });

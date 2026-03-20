@@ -34,6 +34,39 @@ interface UserDriveConfigRow {
   service_logo_file: string | null;
 }
 
+function decodeJwtSub(authorizationHeader: string | null): string | null {
+  if (!authorizationHeader) return null;
+  const token = authorizationHeader.startsWith('Bearer ')
+    ? authorizationHeader.slice('Bearer '.length)
+    : authorizationHeader;
+
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+
+  // base64url -> base64
+  const payloadB64Url = parts[1];
+  const payloadB64 = payloadB64Url.replace(/-/g, '+').replace(/_/g, '/');
+  const padding = '='.repeat((4 - (payloadB64.length % 4)) % 4);
+
+  try {
+    // Decodifica con UTF-8 (evita problemas si el payload trae chars no-ASCII)
+    const bin = atob(payloadB64 + padding);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const jsonStr = new TextDecoder().decode(bytes);
+    const parsed = JSON.parse(jsonStr) as Record<string, unknown>;
+
+    const sub =
+      (typeof parsed.sub === 'string' ? parsed.sub : null) ??
+      (typeof parsed.user_id === 'string' ? parsed.user_id : null) ??
+      (typeof parsed.uid === 'string' ? parsed.uid : null);
+
+    return sub;
+  } catch {
+    return null;
+  }
+}
+
 async function uploadToDrive(
   accessToken: string,
   fileName: string,
@@ -1854,6 +1887,30 @@ Deno.serve(async (req) => {
     });
   }
 
+  // La Edge Function requiere JWT válido de Supabase.
+  // Además, verificamos que el `registroId` pertenece al usuario autenticado.
+  const supabaseAuthHeader = req.headers.get('Authorization');
+  const currentUserId = decodeJwtSub(supabaseAuthHeader);
+  if (!supabaseAuthHeader) {
+    return new Response(JSON.stringify({ ok: false, error: 'Unauthorized: missing Authorization header' }), {
+      status: 401,
+      headers: {
+        'Content-Type': 'application/json',
+        ...corsHeaders(origin)
+      }
+    });
+  }
+
+  if (!currentUserId) {
+    return new Response(JSON.stringify({ ok: false, error: 'Unauthorized: invalid JWT or missing user id claim' }), {
+      status: 401,
+      headers: {
+        'Content-Type': 'application/json',
+        ...corsHeaders(origin)
+      }
+    });
+  }
+
   let registroIdForCleanup: string | null = null;
   try {
     const { registroId, accessToken } = await req.json();
@@ -1887,6 +1944,17 @@ Deno.serve(async (req) => {
       return new Response('El registro no tiene user_id asociado', {
         status: 400,
         headers: corsHeaders(origin)
+      });
+    }
+
+    // Seguridad: solo permitir acciones sobre registros del usuario autenticado.
+    if (data.user_id !== currentUserId) {
+      return new Response(JSON.stringify({ ok: false, error: 'Forbidden: registro pertenece a otro usuario' }), {
+        status: 403,
+        headers: {
+          'Content-Type': 'application/json',
+          ...corsHeaders(origin)
+        }
       });
     }
 
@@ -1976,7 +2044,8 @@ Deno.serve(async (req) => {
     await supabaseServer
       .from('registros_ctpat')
       .update({ sync_status: 'synced', evidencias_exif: { uploadedImages } })
-      .eq('id', data.id);
+      .eq('id', data.id)
+      .eq('user_id', currentUserId);
 
     return new Response(JSON.stringify({ ok: true, driveFile: driveResponse }), {
       status: 200,
@@ -1998,7 +2067,8 @@ Deno.serve(async (req) => {
         await supabaseServer
           .from('registros_ctpat')
           .update({ sync_status: 'error' })
-          .eq('id', registroIdForCleanup);
+          .eq('id', registroIdForCleanup)
+          .eq('user_id', currentUserId);
       } catch {
         // No rompemos el endpoint si falla este marcado.
       }
